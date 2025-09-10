@@ -21,7 +21,7 @@ function castRay(start: LngLat, bearingDeg: number, meters: number) {
 export function isPointShaded(pointLL: LngLat, buildings: BuildingFeature[], when: Date, maxRayMeters = 500): ShadeResult {
   const sun = computeSun(when, pointLL.lat, pointLL.lng);
   if (sun.altitude <= 0) return { shaded: true }; // sun below horizon => effectively shade
-  const ray = castRay(pointLL, sun.shadowBearing, maxRayMeters);
+  const ray = castRay(pointLL, sun.bearingFromNorth, maxRayMeters);
 
   let nearestDist = Infinity;
   let shadedBy: string | number | undefined;

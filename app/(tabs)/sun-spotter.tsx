@@ -1,16 +1,14 @@
 import { ThemedText } from '@/components/ThemedText';
 import { ThemedView } from '@/components/ThemedView';
-import { useBottomTabOverflow } from '@/components/ui/TabBarBackground';
-import { useColorScheme } from '@/hooks/useColorScheme';
-// import { point } from '@turf/helpers';
-// import rhumbDestinationFn from '@turf/rhumb-destination';
-import dayjs from 'dayjs';
+import { fetchBuildingsAround } from '@/lib/overpass';
+import type { BuildingFeature, LngLat } from '@/types';
+import { isPointShaded } from '@/utils/shade';
+import { computeSun } from '@/utils/sun';
 import * as Location from 'expo-location';
-import React, { useEffect, useState } from 'react';
-import { ActivityIndicator, Dimensions, PanResponder, Pressable, StyleSheet, View } from 'react-native';
-import MapView, { Circle, LatLng, MapPressEvent, Marker, Region } from 'react-native-maps';
-// import SunCalc from 'suncalc';
-import { batchShadowMap, isLocationSunnyFromFile } from '@/services/shadowMap';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
+import { Alert, StyleSheet, TouchableOpacity, View } from 'react-native';
+import MapView, { Marker, Polygon, Polyline } from 'react-native-maps';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 type UserLocation = {
   latitude: number;
@@ -18,173 +16,274 @@ type UserLocation = {
 };
 
 export default function SunSpotterScreen() {
-  const [hasPermission, setHasPermission] = useState<boolean | null>(null);
-  const [userLocation, setUserLocation] = useState<UserLocation | null>(null);
-  const [initialRegion, setInitialRegion] = useState<Region | null>(null);
-  const [selectedPoint, setSelectedPoint] = useState<LatLng | null>(null);
-  const [now, setNow] = useState<Date>(() => new Date());
-  const tabBarOverflow = useBottomTabOverflow();
-  const scheme = useColorScheme();
-  
-  const [, setBatchPath] = useState<string | null>(null);
-  const [samples, setSamples] = useState<{ latitude: number; longitude: number; sunny: boolean }[]>([]);
-  const [batching, setBatching] = useState(false);
-  const [batchError, setBatchError] = useState<string | null>(null);
+  const [location, setLocation] = useState<UserLocation | null>(null);
+  const [buildings, setBuildings] = useState<BuildingFeature[]>([]);
+  const [shadowPoints, setShadowPoints] = useState<LngLat[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [timeOfDay, setTimeOfDay] = useState(12); // 0-23 hours
+  const [dayOfYear, setDayOfYear] = useState(180); // 1-365 days
+  const mapRef = useRef<MapView>(null);
+  const insets = useSafeAreaInsets();
 
-  // Remove old building polygon pipeline. Batch is run on demand.
-  const isDark = scheme === 'dark';
-  const timeBg = isDark ? 'rgba(28,28,30,0.92)' : 'rgba(255,255,255,0.9)';
-  const batchBg = isDark ? 'rgba(255,255,255,0.92)' : 'rgba(0,0,0,0.85)';
-  const batchText = isDark ? '#000' : '#fff';
+  const radiusMeters = 30;
 
-  useEffect(() => {
-    let isMounted = true;
-    (async () => {
+  const getCurrentLocation = async () => {
+    try {
       const { status } = await Location.requestForegroundPermissionsAsync();
-      if (!isMounted) return;
-      setHasPermission(status === 'granted');
-      if (status !== 'granted') return;
+      if (status !== 'granted') {
+        Alert.alert('Permission denied', 'Location permission is required to show shadows near you.');
+        return;
+      }
 
-      const current = await Location.getCurrentPositionAsync({});
-      if (!isMounted) return;
-      const coords = {
-        latitude: current.coords.latitude,
-        longitude: current.coords.longitude,
-      };
-      setUserLocation(coords);
-      // Default selection to user location so a shadow is visible immediately.
-      setSelectedPoint(coords);
-      setInitialRegion({
-        latitude: coords.latitude,
-        longitude: coords.longitude,
-        latitudeDelta: 0.02,
-        longitudeDelta: 0.02,
+      const locationData = await Location.getCurrentPositionAsync({});
+      setLocation({
+        latitude: locationData.coords.latitude,
+        longitude: locationData.coords.longitude,
+        
       });
-    })();
-    return () => {
-      isMounted = false;
-    };
-  }, []);
-
-  const handleMapPress = (e: MapPressEvent) => {
-    setSelectedPoint(e.nativeEvent.coordinate);
+    } catch (error) {
+      Alert.alert('Error', 'Failed to get current location');
+      console.error('Location error:', error);
+    }
   };
 
-  // Use platform default map provider to avoid API key requirements.
-  const mapProvider = undefined;
+  const calculateShadows = useCallback(async () => {
+    if (!location) return;
 
-  // old spot-based shadow kept for reference, replaced by building-based shadows
+    setLoading(true);
 
-  if (hasPermission === null || (hasPermission && !initialRegion)) {
-    return (
-      <ThemedView style={styles.centered}>
-        <ActivityIndicator />
-        <ThemedText>Loading map…</ThemedText>
-      </ThemedView>
-    );
-  }
+    try {
+      // Convert day of year to month/day
+      const year = new Date().getFullYear();
+      const date = new Date(year, 0, dayOfYear);
+      const month = date.getMonth() + 1;
+      const day = date.getDate();
+      const testDate = new Date(year, month - 1, day, timeOfDay, 0, 0);
+      
+      // Fetch buildings once
+      if (buildings.length === 0) {
+        const fetchedBuildings = await fetchBuildingsAround(
+          { lng: location.longitude, lat: location.latitude }, 
+          radiusMeters + 50
+        );
+        setBuildings(fetchedBuildings);
+      }
 
-  if (hasPermission === false) {
-    return (
-      <ThemedView style={styles.centered}>
-        <ThemedText>Location permission denied. You can still explore the map.</ThemedText>
-        <View style={{ height: 12 }} />
-        <View style={styles.fallbackMapContainer}>
-          <MapView style={StyleSheet.absoluteFill} onPress={handleMapPress} />
-        </View>
-      </ThemedView>
-    );
-  }
+      // Calculate shadow points with 1m resolution
+      const gridSize = Math.floor((radiusMeters * 2) / 1); // 1m resolution = 60x60 grid
+      const stepSize = 1; // 1 meter per step
+      const shadowPoints: LngLat[] = [];
+      
+      const latMeters = 111132;
+      const lonMeters = 111320 * Math.cos((location.latitude * Math.PI) / 180);
+      
+      for (let i = 0; i < gridSize; i++) {
+        for (let j = 0; j < gridSize; j++) {
+          const xMeters = (i * stepSize) - radiusMeters;
+          const yMeters = (j * stepSize) - radiusMeters;
+          
+          const point: LngLat = {
+            lng: location.longitude + xMeters / lonMeters,
+            lat: location.latitude + yMeters / latMeters,
+          };
+          
+          // Check if point is in shadow
+          const shadeResult = isPointShaded(point, buildings, testDate, 200);
+          if (shadeResult.shaded) {
+            shadowPoints.push(point);
+          }
+        }
+      }
+      
+      setShadowPoints(shadowPoints);
+      
+      console.log('Shadow calculation:', {
+        buildings: buildings.length,
+        shadowPoints: shadowPoints.length,
+        gridSize: `${gridSize}x${gridSize}`,
+        sunInfo: {
+          altitude: (computeSun(testDate, location.latitude, location.longitude).altitude * 180 / Math.PI).toFixed(1) + '°',
+          bearing: computeSun(testDate, location.latitude, location.longitude).bearingFromNorth.toFixed(1) + '°'
+        }
+      });
+    } catch (error) {
+      Alert.alert('Error', 'Failed to calculate shadows');
+      console.error('Shadow calculation error:', error);
+    } finally {
+      setLoading(false);
+    }
+  }, [location, timeOfDay, dayOfYear, buildings, radiusMeters]);
+
+  useEffect(() => {
+    getCurrentLocation();
+  }, []);
+
+  useEffect(() => {
+    if (location) {
+      calculateShadows();
+    }
+  }, [location, timeOfDay, dayOfYear, calculateShadows]);
+
+  const handleMapPress = (event: any) => {
+    const { latitude, longitude } = event.nativeEvent.coordinate;
+    setLocation({ latitude, longitude });
+  };
+
+  const getSunPosition = () => {
+    if (!location) return null;
+    
+    const year = new Date().getFullYear();
+    const date = new Date(year, 0, dayOfYear);
+    const month = date.getMonth() + 1;
+    const day = date.getDate();
+    const testDate = new Date(year, month - 1, day, timeOfDay, 0, 0);
+    
+    const sunInfo = computeSun(testDate, location.latitude, location.longitude);
+    
+    // Calculate sun position on map (extend ray outward from center)
+    const sunDistanceKm = 0.5; // Show sun 500m away from center
+    const sunLat = location.latitude + (sunDistanceKm / 111.32) * Math.cos(sunInfo.bearingFromNorth * Math.PI / 180);
+    const sunLng = location.longitude + (sunDistanceKm / (111.32 * Math.cos(location.latitude * Math.PI / 180))) * Math.sin(sunInfo.bearingFromNorth * Math.PI / 180);
+    
+    return {
+      latitude: sunLat,
+      longitude: sunLng,
+      altitude: sunInfo.altitude,
+      bearing: sunInfo.bearingFromNorth
+    };
+  };
+
+  const renderShadowOverlay = () => {
+    if (!shadowPoints.length || !location) return null;
+
+    const shadowPolygons: any[] = [];
+    const cellSize = 1; // meters - size of each shadow cell
+
+    // Convert shadow points to small polygons
+    shadowPoints.forEach((point, index) => {
+      const latMeters = 111132;
+      const lonMeters = 111320 * Math.cos((location.latitude * Math.PI) / 180);
+      
+      const halfCell = cellSize / 2;
+      const latOffset = halfCell / latMeters;
+      const lngOffset = halfCell / lonMeters;
+      
+      const coordinates = [
+        { latitude: point.lat - latOffset, longitude: point.lng - lngOffset },
+        { latitude: point.lat + latOffset, longitude: point.lng - lngOffset },
+        { latitude: point.lat + latOffset, longitude: point.lng + lngOffset },
+        { latitude: point.lat - latOffset, longitude: point.lng + lngOffset },
+      ];
+      
+      shadowPolygons.push(
+        <Polygon
+          key={`shadow-${index}`}
+          coordinates={coordinates}
+          fillColor="rgba(0, 0, 0, 0.3)"
+          strokeColor="rgba(0, 0, 0, 0.1)"
+          strokeWidth={0.5}
+        />
+      );
+    });
+
+    return shadowPolygons;
+  };
 
   return (
-    <View style={styles.container}>
+    <ThemedView style={styles.container}>
       <MapView
-        provider={mapProvider as any}
-        style={StyleSheet.absoluteFill}
+        ref={mapRef}
+        style={styles.map}
+        onPress={handleMapPress}
         showsUserLocation
         showsMyLocationButton
-        initialRegion={initialRegion ?? undefined}
-        onPress={handleMapPress}
       >
-        {userLocation && (
-          <Marker coordinate={userLocation} title="You" />
-        )}
-        {selectedPoint && (
-          <Marker coordinate={selectedPoint} title="Selected" />
-        )}
-        {samples.map((s, i) => (
-          <Circle
-            key={`s-${i}`}
-            center={{ latitude: s.latitude, longitude: s.longitude }}
-            radius={20}
-            strokeColor={s.sunny ? 'rgba(0,0,0,0.9)' : 'rgba(255,255,255,0.9)'}
-            fillColor={s.sunny ? 'rgba(255,255,255,0.9)' : 'rgba(0,0,0,0.9)'}
-            strokeWidth={1}
+        {location && (
+          <Marker
+            coordinate={location}
+            title="Shadow Analysis Center"
+            description="Tap map to move analysis center"
           />
-        ))}
+        )}
+        {getSunPosition() && location && (
+          <>
+            <Marker
+              coordinate={{
+                latitude: getSunPosition()!.latitude,
+                longitude: getSunPosition()!.longitude
+              }}
+              title="Sun Position"
+              description={`Alt: ${(getSunPosition()!.altitude * 180 / Math.PI).toFixed(1)}° | Bearing: ${getSunPosition()!.bearing.toFixed(1)}°`}
+              pinColor="yellow"
+            />
+            <Polyline
+              coordinates={[
+                { latitude: location.latitude, longitude: location.longitude },
+                { latitude: getSunPosition()!.latitude, longitude: getSunPosition()!.longitude }
+              ]}
+              strokeColor="#FFD700"
+              strokeWidth={3}
+            />
+          </>
+        )}
+        {renderShadowOverlay()}
       </MapView>
 
-      {/* Batch button (bottom-right) */}
-      <View style={[styles.batchContainer, { bottom: 120 + (tabBarOverflow || 0) }]} pointerEvents="box-none">
-        <Pressable
-          style={[styles.batchBtn, { backgroundColor: batchBg }, batching && { opacity: 0.7 }]}
-          hitSlop={8}
-          onPress={async () => {
-            if (!userLocation) return;
-            try {
-              console.log('[Shadow] Batch start');
-              setBatchError(null);
-              setBatching(true);
-              const path = await batchShadowMap(
-                userLocation.longitude,
-                userLocation.latitude,
-                5,
-                0,
-                15,
-                3,
-                8
-              );
-              console.log('[Shadow] Batch done at', path);
-              setBatchPath(path);
-              // sample grid of dots
-              const dots: { latitude: number; longitude: number; sunny: boolean }[] = [];
-              const latMeters = 111132;
-              const lonMeters = 111320 * Math.cos((userLocation.latitude * Math.PI) / 180);
-              for (let y = -1000; y <= 1000; y += 5) {
-                for (let x = -1000; x <= 1000; x += 5) {
-                  const lat = userLocation.latitude + y / latMeters;
-                  const lng = userLocation.longitude + x / lonMeters;
-                  const sunny = await isLocationSunnyFromFile(path, lng, lat);
-                  dots.push({ latitude: lat, longitude: lng, sunny });
-                }
-              }
-              console.log('[Shadow] Dots ready:', dots.length);
-              setSamples(dots);
-            } catch (e: any) {
-              console.warn('[Shadow] Batch error', e);
-              setBatchError(String(e?.message ?? e));
-            } finally {
-              setBatching(false);
-            }
-          }}
-        >
-          <ThemedText style={{ color: batchText, fontWeight: '600' }}>{batching ? 'Batching…' : 'Batch 2km @ 12:00 Aug 3'}</ThemedText>
-        </Pressable>
-        {batchError && (
-          <ThemedText style={styles.batchError}>{batchError}</ThemedText>
-        )}
+      {/* Controls Overlay */}
+      <View style={[styles.controlsOverlay, { bottom: insets.bottom + 80 }]}>
+        <ThemedView style={styles.controlsContainer}>
+          <ThemedText style={styles.controlTitle}>Time Controls</ThemedText>
+          
+          <View style={styles.controlRow}>
+            <ThemedText style={styles.controlLabel}>
+              Time: {timeOfDay.toString().padStart(2, '0')}:00
+            </ThemedText>
+            <View style={styles.buttonRow}>
+              <TouchableOpacity 
+                style={styles.button} 
+                onPress={() => setTimeOfDay(Math.max(0, timeOfDay - 1))}
+              >
+                <ThemedText style={styles.buttonText}>-</ThemedText>
+              </TouchableOpacity>
+              <TouchableOpacity 
+                style={styles.button} 
+                onPress={() => setTimeOfDay(Math.min(23, timeOfDay + 1))}
+              >
+                <ThemedText style={styles.buttonText}>+</ThemedText>
+              </TouchableOpacity>
+            </View>
+          </View>
+
+          <View style={styles.controlRow}>
+            <ThemedText style={styles.controlLabel}>
+              Day: {dayOfYear} ({new Date(new Date().getFullYear(), 0, dayOfYear).toLocaleDateString()})
+            </ThemedText>
+            <View style={styles.buttonRow}>
+              <TouchableOpacity 
+                style={styles.button} 
+                onPress={() => setDayOfYear(Math.max(1, dayOfYear - 1))}
+              >
+                <ThemedText style={styles.buttonText}>-</ThemedText>
+              </TouchableOpacity>
+              <TouchableOpacity 
+                style={styles.button} 
+                onPress={() => setDayOfYear(Math.min(365, dayOfYear + 1))}
+              >
+                <ThemedText style={styles.buttonText}>+</ThemedText>
+              </TouchableOpacity>
+            </View>
+          </View>
+
+          {loading && (
+            <View style={styles.loadingContainer}>
+              <ThemedText style={styles.loadingText}>
+                Calculating shadows...
+              </ThemedText>
+            </View>
+          )}
+        </ThemedView>
       </View>
-
-      {/* Time control overlay with slider */}
-      <TimeSlider
-        bottom={12 + (tabBarOverflow || 0)}
-        value={now}
-        onChange={setNow}
-        backgroundColor={timeBg}
-      />
-
-      
-    </View>
+    </ThemedView>
   );
 }
 
@@ -192,144 +291,63 @@ const styles = StyleSheet.create({
   container: {
     flex: 1,
   },
-  centered: {
+  map: {
     flex: 1,
-    alignItems: 'center',
-    justifyContent: 'center',
-    padding: 16,
   },
-  fallbackMapContainer: {
-    width: '100%',
-    height: 300,
-    borderRadius: 12,
-    overflow: 'hidden',
-  },
-  timeControlContainer: {
+  controlsOverlay: {
     position: 'absolute',
     left: 0,
     right: 0,
-    bottom: 24,
-    alignItems: 'center',
+    padding: 16,
   },
-  timeControl: {
-    paddingHorizontal: 12,
-    paddingVertical: 10,
-    backgroundColor: 'rgba(255,255,255,0.9)',
+  controlsContainer: {
+    backgroundColor: 'rgba(255, 255, 255, 0.95)',
     borderRadius: 12,
+    padding: 12,
     shadowColor: '#000',
-    shadowOpacity: 0.12,
-    shadowRadius: 6,
-    shadowOffset: { width: 0, height: 3 },
-    elevation: 3,
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.25,
+    shadowRadius: 4,
+    elevation: 5,
   },
-  timeText: {
+  controlTitle: {
+    fontSize: 16,
+    fontWeight: 'bold',
+    marginBottom: 12,
     textAlign: 'center',
-    marginBottom: 8,
   },
-  sliderTrack: {
-    height: 24,
-    borderRadius: 12,
-    overflow: 'hidden',
-  },
-  sliderThumb: {
-    position: 'absolute',
-    top: 2,
-    width: 20,
-    height: 20,
-    borderRadius: 10,
-  },
-  sliderRow: {
-    marginTop: 8,
+  controlRow: {
     flexDirection: 'row',
-    alignItems: 'center',
     justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: 12,
   },
-  btnSmall: {
-    paddingHorizontal: 10,
-    paddingVertical: 6,
-    borderRadius: 8,
-    backgroundColor: 'rgba(0,0,0,0.06)'
+  controlLabel: {
+    fontSize: 14,
+    flex: 1,
   },
-  hintText: {
-    marginLeft: 8,
-    opacity: 0.7,
+  buttonRow: {
+    flexDirection: 'row',
+    gap: 8,
   },
-  batchContainer: {
-    position: 'absolute',
-    right: 16,
-    zIndex: 50,
+  button: {
+    backgroundColor: '#007AFF',
+    width: 36,
+    height: 36,
+    borderRadius: 18,
+    justifyContent: 'center',
+    alignItems: 'center',
   },
-  batchBtn: {
-    paddingHorizontal: 14,
-    paddingVertical: 10,
-    borderRadius: 12,
-    shadowColor: '#000',
-    shadowOpacity: 0.2,
-    shadowRadius: 6,
-    shadowOffset: { width: 0, height: 3 },
-    elevation: 4,
+  buttonText: {
+    color: '#fff',
+    fontSize: 18,
+    fontWeight: 'bold',
   },
-  batchError: {
+  loadingContainer: {
     marginTop: 8,
-    color: '#f55'
+  },
+  loadingText: {
+    fontSize: 14,
+    textAlign: 'center',
   },
 });
-
-type TimeSliderProps = {
-  bottom: number;
-  value: Date;
-  onChange: (d: Date) => void;
-  backgroundColor: string;
-};
-
-function TimeSlider({ bottom, value, onChange, backgroundColor }: TimeSliderProps) {
-  const windowWidth = Dimensions.get('window').width;
-  const fallbackWidth = Math.max(220, Math.min(560, windowWidth - 48));
-  const [width, setWidth] = React.useState(fallbackWidth);
-  const startOfDay = dayjs(value).startOf('day');
-  const endOfDay = dayjs(value).endOf('day');
-  const totalMs = endOfDay.valueOf() - startOfDay.valueOf();
-  const progress = Math.max(0, Math.min(1, (value.getTime() - startOfDay.valueOf()) / totalMs));
-
-  const pan = React.useRef(
-    PanResponder.create({
-      onStartShouldSetPanResponder: () => true,
-      onPanResponderGrant: (e) => {
-        const x = e.nativeEvent.locationX;
-        const p = Math.max(0, Math.min(1, x / (width || 1)));
-        onChange(new Date(startOfDay.valueOf() + p * totalMs));
-      },
-      onPanResponderMove: (e) => {
-        const w = width || fallbackWidth;
-        const localX = e.nativeEvent.locationX;
-        const x = Math.max(0, Math.min(w, localX));
-        const p = Math.max(0, Math.min(1, x / w));
-        onChange(new Date(startOfDay.valueOf() + p * totalMs));
-      },
-    })
-  ).current;
-
-  const thumbLeft = Math.round(progress * Math.max(0, width - 20));
-
-  return (
-    <View style={[styles.timeControlContainer, { bottom }]} pointerEvents="box-none">
-      <View style={[styles.timeControl, { backgroundColor }]}>
-        <ThemedText style={styles.timeText}>{dayjs(value).format('MMM D • HH:mm')}</ThemedText>
-        <View
-          style={[styles.sliderTrack, { backgroundColor: 'rgba(0,0,0,0.1)', width }]}
-          onLayout={(e) => setWidth(e.nativeEvent.layout.width || fallbackWidth)}
-          {...pan.panHandlers}
-        >
-          <View style={[styles.sliderThumb, { left: thumbLeft, backgroundColor: 'white' }]} />
-        </View>
-        <View style={styles.sliderRow}>
-          <Pressable style={styles.btnSmall} onPress={() => onChange(new Date())}><ThemedText>Now</ThemedText></Pressable>
-          <ThemedText style={styles.hintText}>Drag to change time</ThemedText>
-        </View>
-      </View>
-    </View>
-  );
-}
-
-
-
