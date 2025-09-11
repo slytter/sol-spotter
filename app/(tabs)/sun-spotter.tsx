@@ -1,7 +1,7 @@
 import { ThemedText } from '@/components/ThemedText';
 import { ThemedView } from '@/components/ThemedView';
 import { fetchBuildingsAround } from '@/lib/overpass';
-import type { BuildingFeature, LngLat } from '@/types';
+import type { LngLat } from '@/types';
 import { isPointShaded } from '@/utils/shade';
 import { computeSun } from '@/utils/sun';
 import * as Location from 'expo-location';
@@ -17,11 +17,11 @@ type UserLocation = {
 
 export default function SunSpotterScreen() {
   const [location, setLocation] = useState<UserLocation | null>(null);
-  const [buildings, setBuildings] = useState<BuildingFeature[]>([]);
   const [shadowPoints, setShadowPoints] = useState<LngLat[]>([]);
   const [loading, setLoading] = useState(false);
   const [timeOfDay, setTimeOfDay] = useState(12); // 0-23 hours
   const [dayOfYear, setDayOfYear] = useState(180); // 1-365 days
+  const [useElevationModel, setUseElevationModel] = useState(true); // Toggle for height models
   const mapRef = useRef<MapView>(null);
   const insets = useSafeAreaInsets();
 
@@ -47,6 +47,24 @@ export default function SunSpotterScreen() {
     }
   };
 
+  const isPointInsidePolygon = (point: LngLat, polygon: [number, number][]): boolean => {
+    // Ray casting algorithm to check if point is inside polygon
+    const x = point.lng;
+    const y = point.lat;
+    let inside = false;
+    
+    for (let i = 0, j = polygon.length - 1; i < polygon.length; j = i++) {
+      const xi = polygon[i][0], yi = polygon[i][1];
+      const xj = polygon[j][0], yj = polygon[j][1];
+      
+      if (((yi > y) !== (yj > y)) && (x < (xj - xi) * (y - yi) / (yj - yi) + xi)) {
+        inside = !inside;
+      }
+    }
+    
+    return inside;
+  };
+
   const calculateShadows = useCallback(async () => {
     if (!location) return;
 
@@ -55,19 +73,16 @@ export default function SunSpotterScreen() {
     try {
       // Convert day of year to month/day
       const year = new Date().getFullYear();
-      const date = new Date(year, 0, dayOfYear);
-      const month = date.getMonth() + 1;
-      const day = date.getDate();
-      const testDate = new Date(year, month - 1, day, timeOfDay, 0, 0);
+      // Correctly calculate date from day of year
+      const testDate = new Date(year, 0, 1, timeOfDay, 0, 0); // Start with Jan 1
+      testDate.setDate(dayOfYear); // Add dayOfYear days
       
-      // Fetch buildings once
-      if (buildings.length === 0) {
-        const fetchedBuildings = await fetchBuildingsAround(
-          { lng: location.longitude, lat: location.latitude }, 
-          radiusMeters + 50
-        );
-        setBuildings(fetchedBuildings);
-      }
+      // Fetch buildings (always fetch to respect toggle changes)
+      const fetchedBuildings = await fetchBuildingsAround(
+        { lng: location.longitude, lat: location.latitude }, 
+        radiusMeters + 50,
+        useElevationModel
+      );
 
       // Calculate shadow points with 1m resolution
       const gridSize = Math.floor((radiusMeters * 2) / 1); // 1m resolution = 60x60 grid
@@ -88,7 +103,7 @@ export default function SunSpotterScreen() {
           };
           
           // Check if point is in shadow
-          const shadeResult = isPointShaded(point, buildings, testDate, 200);
+          const shadeResult = isPointShaded(point, fetchedBuildings, testDate, 200);
           if (shadeResult.shaded) {
             shadowPoints.push(point);
           }
@@ -96,23 +111,13 @@ export default function SunSpotterScreen() {
       }
       
       setShadowPoints(shadowPoints);
-      
-      console.log('Shadow calculation:', {
-        buildings: buildings.length,
-        shadowPoints: shadowPoints.length,
-        gridSize: `${gridSize}x${gridSize}`,
-        sunInfo: {
-          altitude: (computeSun(testDate, location.latitude, location.longitude).altitude * 180 / Math.PI).toFixed(1) + '°',
-          bearing: computeSun(testDate, location.latitude, location.longitude).bearingFromNorth.toFixed(1) + '°'
-        }
-      });
     } catch (error) {
       Alert.alert('Error', 'Failed to calculate shadows');
       console.error('Shadow calculation error:', error);
     } finally {
       setLoading(false);
     }
-  }, [location, timeOfDay, dayOfYear, buildings, radiusMeters]);
+  }, [location, timeOfDay, dayOfYear, useElevationModel, radiusMeters]);
 
   useEffect(() => {
     getCurrentLocation();
@@ -133,10 +138,8 @@ export default function SunSpotterScreen() {
     if (!location) return null;
     
     const year = new Date().getFullYear();
-    const date = new Date(year, 0, dayOfYear);
-    const month = date.getMonth() + 1;
-    const day = date.getDate();
-    const testDate = new Date(year, month - 1, day, timeOfDay, 0, 0);
+    const testDate = new Date(year, 0, 1, timeOfDay, 0, 0);
+    testDate.setDate(dayOfYear);
     
     const sunInfo = computeSun(testDate, location.latitude, location.longitude);
     
@@ -150,6 +153,65 @@ export default function SunSpotterScreen() {
       longitude: sunLng,
       altitude: sunInfo.altitude,
       bearing: sunInfo.bearingFromNorth
+    };
+  };
+
+  const getSun3DVisualization = () => {
+    if (!location) return null;
+    
+    const year = new Date().getFullYear();
+    const testDate = new Date(year, 0, 1, timeOfDay, 0, 0);
+    testDate.setDate(dayOfYear);
+    
+    const sunInfo = computeSun(testDate, location.latitude, location.longitude);
+    
+    // Create enhanced 3D visualization
+    const baseDistance = 0.05; // 50m base distance for visualization
+    
+    // Calculate sun's apparent position accounting for altitude
+    // The sun appears closer to the horizon when altitude is low
+    const altitudeFactor = Math.sin(sunInfo.altitude); // 0 = horizon, 1 = overhead
+    const sunDistance = baseDistance / Math.max(0.1, altitudeFactor); // Closer when low altitude
+    
+    // Sun direction (where sun appears to be)
+    const sunLat = location.latitude + (sunDistance / 111.32) * Math.cos(sunInfo.bearingFromNorth * Math.PI / 180);
+    const sunLng = location.longitude + (sunDistance / (111.32 * Math.cos(location.latitude * Math.PI / 180))) * Math.sin(sunInfo.bearingFromNorth * Math.PI / 180);
+    
+    // Shadow direction (opposite to sun)
+    const shadowBearing = (sunInfo.bearingFromNorth + 180) % 360;
+    const shadowLat = location.latitude + (baseDistance / 111.32) * Math.cos(shadowBearing * Math.PI / 180);
+    const shadowLng = location.longitude + (baseDistance / (111.32 * Math.cos(location.latitude * Math.PI / 180))) * Math.sin(shadowBearing * Math.PI / 180);
+    
+    // Calculate shadow length for different building heights
+    const buildingHeights = [5, 10, 20]; // meters
+    const shadowTips = buildingHeights.map(height => {
+      const shadowLength = height / Math.tan(sunInfo.altitude);
+      const shadowLengthKm = shadowLength / 1000;
+      return {
+        height,
+        length: shadowLength,
+        latitude: location.latitude + (shadowLengthKm / 111.32) * Math.cos(shadowBearing * Math.PI / 180),
+        longitude: location.longitude + (shadowLengthKm / (111.32 * Math.cos(location.latitude * Math.PI / 180))) * Math.sin(shadowBearing * Math.PI / 180)
+      };
+    });
+    
+    return {
+      sun: {
+        latitude: sunLat,
+        longitude: sunLng,
+        altitude: sunInfo.altitude,
+        bearing: sunInfo.bearingFromNorth,
+        distance: sunDistance,
+        altitudeFactor
+      },
+      shadow: {
+        direction: {
+          latitude: shadowLat,
+          longitude: shadowLng
+        },
+        tips: shadowTips,
+        bearing: shadowBearing
+      }
     };
   };
 
@@ -205,25 +267,65 @@ export default function SunSpotterScreen() {
             description="Tap map to move analysis center"
           />
         )}
-        {getSunPosition() && location && (
+        {getSun3DVisualization() && location && (
           <>
+            {/* Sun Direction Marker (positioned based on altitude) */}
             <Marker
               coordinate={{
-                latitude: getSunPosition()!.latitude,
-                longitude: getSunPosition()!.longitude
+                latitude: getSun3DVisualization()!.sun.latitude,
+                longitude: getSun3DVisualization()!.sun.longitude
               }}
-              title="Sun Position"
-              description={`Alt: ${(getSunPosition()!.altitude * 180 / Math.PI).toFixed(1)}° | Bearing: ${getSunPosition()!.bearing.toFixed(1)}°`}
+              title="Sun Position (3D Projected)"
+              description={`Alt: ${(getSun3DVisualization()!.sun.altitude * 180 / Math.PI).toFixed(1)}° | Dist: ${(getSun3DVisualization()!.sun.distance * 1000).toFixed(0)}m | Factor: ${getSun3DVisualization()!.sun.altitudeFactor.toFixed(2)}`}
               pinColor="yellow"
             />
+            
+            {/* Sun Direction Line (thickness varies with altitude) */}
             <Polyline
               coordinates={[
                 { latitude: location.latitude, longitude: location.longitude },
-                { latitude: getSunPosition()!.latitude, longitude: getSunPosition()!.longitude }
+                { latitude: getSun3DVisualization()!.sun.latitude, longitude: getSun3DVisualization()!.sun.longitude }
               ]}
               strokeColor="#FFD700"
+              strokeWidth={Math.max(2, 8 * getSun3DVisualization()!.sun.altitudeFactor)}
+            />
+            
+            {/* Shadow Direction Line */}
+            <Polyline
+              coordinates={[
+                { latitude: location.latitude, longitude: location.longitude },
+                { latitude: getSun3DVisualization()!.shadow.direction.latitude, longitude: getSun3DVisualization()!.shadow.direction.longitude }
+              ]}
+              strokeColor="#FF6B6B"
               strokeWidth={3}
             />
+            
+            {/* Multiple Shadow Length Visualizations */}
+            {getSun3DVisualization()!.shadow.tips.map((tip, index) => {
+              const colors = ['#8B0000', '#A52A2A', '#DC143C'];
+              const strokeWidths = [2, 3, 4];
+              return (
+                <React.Fragment key={tip.height}>
+                  <Polyline
+                    coordinates={[
+                      { latitude: location.latitude, longitude: location.longitude },
+                      { latitude: tip.latitude, longitude: tip.longitude }
+                    ]}
+                    strokeColor={colors[index]}
+                    strokeWidth={strokeWidths[index]}
+                  />
+                  <Marker
+                    coordinate={{
+                      latitude: tip.latitude,
+                      longitude: tip.longitude
+                    }}
+                    title={`${tip.height}m Building Shadow`}
+                    description={`Length: ${tip.length.toFixed(1)}m`}
+                    pinColor="red"
+                  />
+                </React.Fragment>
+              );
+            })}
           </>
         )}
         {renderShadowOverlay()}
@@ -273,6 +375,43 @@ export default function SunSpotterScreen() {
               </TouchableOpacity>
             </View>
           </View>
+
+          <View style={styles.controlRow}>
+            <ThemedText style={styles.controlLabel}>
+              Height Model: {useElevationModel ? 'Building Heights' : 'Simple'}
+            </ThemedText>
+            <TouchableOpacity 
+              style={[styles.button, { backgroundColor: useElevationModel ? '#007AFF' : '#CCCCCC' }]} 
+              onPress={() => setUseElevationModel(!useElevationModel)}
+            >
+              <ThemedText style={styles.buttonText}>
+                {useElevationModel ? 'ON' : 'OFF'}
+              </ThemedText>
+            </TouchableOpacity>
+          </View>
+          
+          {/* Debug Info */}
+          {getSun3DVisualization() && (
+            <View style={styles.debugInfo}>
+              <ThemedText style={styles.debugText}>
+                Sun Altitude: {(getSun3DVisualization()!.sun.altitude * 180 / Math.PI).toFixed(1)}°
+              </ThemedText>
+              <ThemedText style={styles.debugText}>
+                Sun Distance: {(getSun3DVisualization()!.sun.distance * 1000).toFixed(0)}m
+              </ThemedText>
+              <ThemedText style={styles.debugText}>
+                Altitude Factor: {getSun3DVisualization()!.sun.altitudeFactor.toFixed(2)}
+              </ThemedText>
+              {/* {getSun3DVisualization()!.shadow.tips.map((tip, index) => (
+                <ThemedText key={tip.height} style={styles.debugText}>
+                  {tip.height}m Building Shadow: {tip.length.toFixed(1)}m
+                </ThemedText>
+              ))}
+              <ThemedText style={styles.debugText}>
+                Sun Bearing: {getSun3DVisualization()!.sun.bearing.toFixed(1)}°
+              </ThemedText> */}
+            </View>
+          )}
 
           {loading && (
             <View style={styles.loadingContainer}>
@@ -349,5 +488,16 @@ const styles = StyleSheet.create({
   loadingText: {
     fontSize: 14,
     textAlign: 'center',
+  },
+  debugInfo: {
+    marginTop: 8,
+    padding: 8,
+    backgroundColor: 'rgba(0, 0, 0, 0.05)',
+    borderRadius: 6,
+  },
+  debugText: {
+    fontSize: 12,
+    color: '#666',
+    marginBottom: 2,
   },
 });
