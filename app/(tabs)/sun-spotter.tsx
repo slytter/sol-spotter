@@ -1,7 +1,7 @@
 import { ThemedText } from '@/components/ThemedText';
 import { ThemedView } from '@/components/ThemedView';
 import { fetchBuildingsAround } from '@/lib/overpass';
-import type { LngLat } from '@/types';
+import type { BuildingFeature, LngLat } from '@/types';
 import { isPointShaded } from '@/utils/shade';
 import { computeSun } from '@/utils/sun';
 import * as Location from 'expo-location';
@@ -45,6 +45,15 @@ export default function SunSpotterScreen() {
       Alert.alert('Error', 'Failed to get current location');
       console.error('Location error:', error);
     }
+  };
+
+  const isPointInsideAnyBuilding = (point: LngLat, buildings: BuildingFeature[]): boolean => {
+    for (const building of buildings) {
+      if (isPointInsidePolygon(point, building.outer)) {
+        return true;
+      }
+    }
+    return false;
   };
 
   const isPointInsidePolygon = (point: LngLat, polygon: [number, number][]): boolean => {
@@ -278,16 +287,6 @@ export default function SunSpotterScreen() {
               title="Sun Position (3D Projected)"
               description={`Alt: ${(getSun3DVisualization()!.sun.altitude * 180 / Math.PI).toFixed(1)}° | Dist: ${(getSun3DVisualization()!.sun.distance * 1000).toFixed(0)}m | Factor: ${getSun3DVisualization()!.sun.altitudeFactor.toFixed(2)}`}
               pinColor="yellow"
-            />
-            
-            {/* Sun Direction Line (thickness varies with altitude) */}
-            <Polyline
-              coordinates={[
-                { latitude: location.latitude, longitude: location.longitude },
-                { latitude: getSun3DVisualization()!.sun.latitude, longitude: getSun3DVisualization()!.sun.longitude }
-              ]}
-              strokeColor="#FFD700"
-              strokeWidth={Math.max(2, 8 * getSun3DVisualization()!.sun.altitudeFactor)}
             />
             
             {/* Shadow Direction Line */}
