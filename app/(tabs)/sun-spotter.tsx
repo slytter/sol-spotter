@@ -1,12 +1,14 @@
+import SimpleMetalTest from '@/components/SimpleMetalTest';
 import { ThemedText } from '@/components/ThemedText';
 import { ThemedView } from '@/components/ThemedView';
 import { fetchBuildingsAround } from '@/lib/overpass';
-import type { BuildingFeature, LngLat } from '@/types';
+import type { LngLat } from '@/types';
+import { calculateShadowsGPU, type MetalBuilding, type MetalPoint } from '@/utils/metal-shadows';
 import { isPointShaded } from '@/utils/shade';
 import { computeSun } from '@/utils/sun';
 import * as Location from 'expo-location';
 import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { Alert, StyleSheet, TouchableOpacity, View } from 'react-native';
+import { Alert, Platform, StyleSheet, TouchableOpacity, View } from 'react-native';
 import MapView, { Marker, Polygon, Polyline } from 'react-native-maps';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
@@ -22,6 +24,7 @@ export default function SunSpotterScreen() {
   const [timeOfDay, setTimeOfDay] = useState(12); // 0-23 hours
   const [dayOfYear, setDayOfYear] = useState(180); // 1-365 days
   const [useElevationModel, setUseElevationModel] = useState(true); // Toggle for height models
+  const [showMetalTest, setShowMetalTest] = useState(false);
   const mapRef = useRef<MapView>(null);
   const insets = useSafeAreaInsets();
 
@@ -47,32 +50,6 @@ export default function SunSpotterScreen() {
     }
   };
 
-  const isPointInsideAnyBuilding = (point: LngLat, buildings: BuildingFeature[]): boolean => {
-    for (const building of buildings) {
-      if (isPointInsidePolygon(point, building.outer)) {
-        return true;
-      }
-    }
-    return false;
-  };
-
-  const isPointInsidePolygon = (point: LngLat, polygon: [number, number][]): boolean => {
-    // Ray casting algorithm to check if point is inside polygon
-    const x = point.lng;
-    const y = point.lat;
-    let inside = false;
-    
-    for (let i = 0, j = polygon.length - 1; i < polygon.length; j = i++) {
-      const xi = polygon[i][0], yi = polygon[i][1];
-      const xj = polygon[j][0], yj = polygon[j][1];
-      
-      if (((yi > y) !== (yj > y)) && (x < (xj - xi) * (y - yi) / (yj - yi) + xi)) {
-        inside = !inside;
-      }
-    }
-    
-    return inside;
-  };
 
   const calculateShadows = useCallback(async () => {
     if (!location) return;
@@ -87,11 +64,14 @@ export default function SunSpotterScreen() {
       testDate.setDate(dayOfYear); // Add dayOfYear days
       
       // Fetch buildings (always fetch to respect toggle changes)
+      const buildingStartTime = Date.now();
       const fetchedBuildings = await fetchBuildingsAround(
         { lng: location.longitude, lat: location.latitude }, 
         radiusMeters + 50,
         useElevationModel
       );
+        const buildingEndTime = Date.now();
+        console.log(`🏢 Building Data Fetch: ${buildingEndTime - buildingStartTime}ms`);
 
       // Calculate shadow points with 1m resolution
       const gridSize = Math.floor((radiusMeters * 2) / 1); // 1m resolution = 60x60 grid
@@ -101,22 +81,79 @@ export default function SunSpotterScreen() {
       const latMeters = 111132;
       const lonMeters = 111320 * Math.cos((location.latitude * Math.PI) / 180);
       
+      // Generate all points
+      const allPoints: MetalPoint[] = [];
       for (let i = 0; i < gridSize; i++) {
         for (let j = 0; j < gridSize; j++) {
           const xMeters = (i * stepSize) - radiusMeters;
           const yMeters = (j * stepSize) - radiusMeters;
           
-          const point: LngLat = {
+          allPoints.push({
             lng: location.longitude + xMeters / lonMeters,
             lat: location.latitude + yMeters / latMeters,
-          };
+          });
+        }
+      }
+      
+      // Convert buildings to Metal format
+      const metalBuildings: MetalBuilding[] = fetchedBuildings.map(building => ({
+        height: building.height,
+        vertices: building.outer.map(coord => [coord[0], coord[1]])
+      }));
+      
+      // Calculate sun position once
+      const sunInfo = computeSun(testDate, location.latitude, location.longitude);
+      
+      console.log(`🚀 Starting GPU shadow calculation with Metal...`);
+      console.log(`📊 Processing ${allPoints.length} points with ${metalBuildings.length} buildings`);
+      
+      const gpuStartTime = Date.now();
+      
+      if (Platform.OS === 'ios') {
+        try {
+          // Use Metal GPU acceleration
+          const gpuResult = await calculateShadowsGPU(
+            allPoints,
+            metalBuildings,
+            sunInfo.altitude,
+            sunInfo.bearingFromNorth
+          );
           
-          // Check if point is in shadow
+          const gpuEndTime = Date.now();
+          console.log(`🔥 GPU Shadow Calculation: ${gpuResult.processingTime}ms`);
+          console.log(`⚡ Total Time: ${gpuEndTime - gpuStartTime}ms`);
+          console.log(`🎯 Found ${gpuResult.shadowIndices.length} shadow points`);
+          
+          // Convert shadow indices back to points
+          for (const index of gpuResult.shadowIndices) {
+            shadowPoints.push(allPoints[index]);
+          }
+          
+        } catch (error) {
+          console.warn('GPU calculation failed, falling back to CPU:', error);
+          // Fallback to CPU calculation
+          const cpuStartTime = Date.now();
+          for (const point of allPoints) {
+            const shadeResult = isPointShaded(point, fetchedBuildings, testDate, 200);
+            if (shadeResult.shaded) {
+              shadowPoints.push(point);
+            }
+          }
+          const cpuEndTime = Date.now();
+          console.log(`💻 CPU Fallback: ${cpuEndTime - cpuStartTime}ms`);
+        }
+      } else {
+        // Android fallback to CPU
+        console.log(`🤖 Android detected, using CPU calculation`);
+        const cpuStartTime = Date.now();
+        for (const point of allPoints) {
           const shadeResult = isPointShaded(point, fetchedBuildings, testDate, 200);
           if (shadeResult.shaded) {
             shadowPoints.push(point);
           }
         }
+        const cpuEndTime = Date.now();
+        console.log(`💻 CPU Calculation: ${cpuEndTime - cpuStartTime}ms`);
       }
       
       setShadowPoints(shadowPoints);
@@ -388,6 +425,20 @@ export default function SunSpotterScreen() {
               </ThemedText>
             </TouchableOpacity>
           </View>
+
+          <View style={styles.controlRow}>
+            <ThemedText style={styles.controlLabel}>
+              Metal GPU Test
+            </ThemedText>
+            <TouchableOpacity 
+              style={[styles.button, { backgroundColor: showMetalTest ? '#28A745' : '#007AFF' }]} 
+              onPress={() => setShowMetalTest(!showMetalTest)}
+            >
+              <ThemedText style={styles.buttonText}>
+                {showMetalTest ? 'HIDE' : 'TEST'}
+              </ThemedText>
+            </TouchableOpacity>
+          </View>
           
           {/* Debug Info */}
           {getSun3DVisualization() && (
@@ -421,6 +472,13 @@ export default function SunSpotterScreen() {
           )}
         </ThemedView>
       </View>
+
+      {/* Metal Test Overlay */}
+      {showMetalTest && (
+        <View style={[styles.metalTestOverlay, { top: insets.top + 20 }]}>
+          <SimpleMetalTest />
+        </View>
+      )}
     </ThemedView>
   );
 }
@@ -498,5 +556,18 @@ const styles = StyleSheet.create({
     fontSize: 12,
     color: '#666',
     marginBottom: 2,
+  },
+  metalTestOverlay: {
+    position: 'absolute',
+    left: 20,
+    right: 20,
+    backgroundColor: 'rgba(255, 255, 255, 0.95)',
+    borderRadius: 12,
+    padding: 16,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.25,
+    shadowRadius: 4,
+    elevation: 5,
   },
 });
